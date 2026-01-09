@@ -1,0 +1,10 @@
+[project]
+name = "tinyharfoundation"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "tensorflow>=2.20.0",
+    "tflite>=2.18.0",
+]
