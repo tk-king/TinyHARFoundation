@@ -108,7 +108,7 @@ def build_transformer_backbone_seq(
     x = L.LayerNormalization(name="feat_ln")(x)  # (B,T,C)
     return tf.keras.Model(x_in, x, name="imu_transformer_backbone_seq")
 
-def build_conv_backbone_seq(ts_len: int, c: int = 128, dropout: float = 0.1) -> tf.keras.Model:
+def build_conv_backbone_seq(ts_len: int, c: int = 64, dropout: float = 0.1) -> tf.keras.Model:
     x_in = tf.keras.Input(shape=(ts_len, 9), name="imu")  # (B,T,9)
     x = L.LayerNormalization()(x_in)
 
@@ -119,8 +119,8 @@ def build_conv_backbone_seq(ts_len: int, c: int = 128, dropout: float = 0.1) -> 
 
     # ResNet/TCN-style blocks -> (B,T,C)
     for i, (filters, dilation, k) in enumerate([
-        (16, 1, 5),
-        (32, 2, 5),
+        (8, 1, 5),
+        (16, 2, 5),
         # (64, 1, 5),
         (c,  1, 3),
         (c,  2, 3),
@@ -146,3 +146,34 @@ def build_conv_backbone_seq(ts_len: int, c: int = 128, dropout: float = 0.1) -> 
 
     x = L.LayerNormalization(name="feat_ln")(x)  # (B,T,C)
     return tf.keras.Model(x_in, x, name="imu_conv_backbone_seq")
+
+
+
+def build_two_view_backbone_seq(
+    base_backbone: tf.keras.Model,
+    *,
+    ts_len: int,
+    in_channels: int = 9,
+    name: str = "imu_two_view_backbone_seq",
+) -> tf.keras.Model:
+    """
+    Wrap a per-sequence backbone (B,T,C_in)->(B,T,C) to accept two views:
+      Input:  (B,2,T,C_in)
+      Output: (B,2,T,C)
+
+    Does NOT merge view into batch (avoids batch-coupled/statistical ops mixing views).
+    """
+    x_in = tf.keras.Input(shape=(2, ts_len, in_channels), name="imu_2view")
+
+    # Slice views: each is (B, T, C_in)
+    x0 = tf.keras.layers.Lambda(lambda x: x[:, 0], name="view0")(x_in)
+    x1 = tf.keras.layers.Lambda(lambda x: x[:, 1], name="view1")(x_in)
+
+    # Apply same backbone (shared weights) to each view
+    y0 = base_backbone(x0)  # (B, T, C)
+    y1 = base_backbone(x1)  # (B, T, C)
+
+    # Stack back to (B, 2, T, C)
+    y = tf.keras.layers.Lambda(lambda ys: tf.stack(ys, axis=1), name="stack_views")([y0, y1])
+
+    return tf.keras.Model(inputs=x_in, outputs=y, name=name)

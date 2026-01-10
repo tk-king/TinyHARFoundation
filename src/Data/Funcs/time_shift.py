@@ -23,5 +23,6 @@ def aug_time_shift(x: Array, max_time_shift: int, *, rng: np.random.Generator | 
     out = np.array(x, copy=True)
     for i, s in enumerate(shifts.tolist()):
         if s != 0:
-            out[i] = np.roll(out[i], shift=int(s), axis=2)
+            # `out[i]` is [1, T, C], so shift along time axis (T).
+            out[i] = np.roll(out[i], shift=int(s), axis=-2)
     return out

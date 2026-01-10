@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
+import warnings
 
 from .Funcs.channel_drop import aug_channel_drop
 from .Funcs.jitter import aug_jitter
@@ -39,33 +40,103 @@ class AugConfig:
     quant_step: float = 0.01
     scale_per_channel: bool = False
 
+    # diversity helpers (optional)
+    randomize_params: bool = False
+    # multiplicative jitter range for params when randomize_params=True.
+    # Example: 0.5 -> multiplier sampled from [0.5, 1.5].
+    param_jitter: float = 0.5
+
 
 class InertialAugmentRandomCombo:
     """
     Input: x [B, 1, T, C] (numpy array)
     For each sample i, randomly chooses k ops (k in [min_ops, max_ops]) without replacement,
     biased by probs, then applies them sequentially.
+
+    Valid op names: time_shift, scale, channel_drop, time_mask, jitter, rotate, resample, quantize.
+    Accepted aliases: scaling->scale, rotation->rotate, time_warp->resample.
     """
 
     def __init__(self, cfg: AugConfig, rng: np.random.Generator | None = None):
         self.cfg = cfg
         self.rng = rng or np.random.default_rng()
+        self.last_plans: List[List[str]] | None = None
 
-        # registry: name -> callable(batch_subset -> batch_subset)
-        self.ops: Dict[str, Callable[[Array], Array]] = {
-            "time_shift": lambda s: aug_time_shift(s, cfg.max_time_shift, rng=self.rng),
-            "scale": lambda s: aug_scale(s, cfg.scale_jitter, per_channel=cfg.scale_per_channel, rng=self.rng),
-            "channel_drop": lambda s: aug_channel_drop(s, cfg.channel_drop_prob, rng=self.rng),
-            "time_mask": lambda s: aug_time_mask(s, cfg.time_mask_ratio, rng=self.rng),
-            "jitter": lambda s: aug_jitter(s, cfg.jitter_std, rng=self.rng),
-            "rotate": lambda s: aug_rotate_triads(s, cfg.rotate_triads or [], cfg.max_rotate_deg, rng=self.rng),
-            "resample": lambda s: aug_resample(s, cfg.resample_min_factor, cfg.resample_max_factor, rng=self.rng),
-            "quantize": lambda s: aug_quantize(s, cfg.quant_step),
+        # Backwards/interop-friendly aliases for common augmentation naming.
+        # If both alias and canonical are provided, the higher probability wins.
+        self._aliases: Dict[str, str] = {
+            "scaling": "scale",
+            "rotation": "rotate",
+            "time_warp": "resample",
         }
 
-        self.enabled = [k for k, p in cfg.probs.items() if p > 0 and k in self.ops]
+        resolved_probs: Dict[str, float] = {}
+        unknown: List[str] = []
+        for name, prob in (cfg.probs or {}).items():
+            canonical = self._aliases.get(name, name)
+            if canonical not in {
+                "time_shift",
+                "scale",
+                "channel_drop",
+                "time_mask",
+                "jitter",
+                "rotate",
+                "resample",
+                "quantize",
+            }:
+                unknown.append(name)
+                continue
+            resolved_probs[canonical] = max(float(prob), float(resolved_probs.get(canonical, 0.0)))
+
+        if unknown:
+            warnings.warn(
+                "Ignoring unknown augmentation keys in cfg.probs: "
+                + ", ".join(sorted(set(unknown)))
+                + ". Valid keys: time_shift, scale, channel_drop, time_mask, jitter, rotate, resample, quantize. "
+                + "Aliases: scaling->scale, rotation->rotate, time_warp->resample.",
+                stacklevel=2,
+            )
+
+        # registry: name -> callable(batch_subset -> batch_subset)
+        def _mul(base: float) -> float:
+            if not cfg.randomize_params:
+                return float(base)
+            j = float(max(0.0, cfg.param_jitter))
+            m = float(self.rng.uniform(1.0 - j, 1.0 + j))
+            return float(base) * m
+
+        self.ops: Dict[str, Callable[[Array], Array]] = {
+            "time_shift": lambda s: aug_time_shift(s, cfg.max_time_shift, rng=self.rng),
+            "scale": lambda s: aug_scale(
+                s,
+                _mul(cfg.scale_jitter),
+                per_channel=cfg.scale_per_channel,
+                rng=self.rng,
+            ),
+            "channel_drop": lambda s: aug_channel_drop(s, cfg.channel_drop_prob, rng=self.rng),
+            "time_mask": lambda s: aug_time_mask(s, _mul(cfg.time_mask_ratio), rng=self.rng),
+            "jitter": lambda s: aug_jitter(s, _mul(cfg.jitter_std), rng=self.rng),
+            "rotate": lambda s: aug_rotate_triads(
+                s,
+                (
+                    cfg.rotate_triads
+                    if cfg.rotate_triads is not None
+                    else [(i, i + 1, i + 2) for i in range(0, int(s.shape[-1]) - 2, 3)]
+                ),
+                _mul(cfg.max_rotate_deg),
+                rng=self.rng,
+            ),
+            "resample": lambda s: aug_resample(s, cfg.resample_min_factor, cfg.resample_max_factor, rng=self.rng),
+            "quantize": lambda s: aug_quantize(s, _mul(cfg.quant_step)),
+        }
+
+        self._probs = resolved_probs
+        self.enabled = [k for k, p in self._probs.items() if p > 0 and k in self.ops]
         if not self.enabled:
-            raise ValueError("No augmentations enabled. Set cfg.probs with >0 for at least one op.")
+            raise ValueError(
+                "No augmentations enabled. Set cfg.probs with >0 for at least one op. "
+                "Valid keys: time_shift, scale, channel_drop, time_mask, jitter, rotate, resample, quantize."
+            )
 
     def _sample_ops(self) -> List[str]:
         cfg = self.cfg
@@ -81,7 +152,7 @@ class InertialAugmentRandomCombo:
             return []
 
         names = self.enabled
-        weights = np.asarray([self.cfg.probs[n] for n in names], dtype=np.float64)
+        weights = np.asarray([self._probs[n] for n in names], dtype=np.float64)
         weights = weights / (weights.sum() + 1e-12)
 
         chosen = self.rng.choice(names, size=k, replace=False, p=weights)
@@ -96,6 +167,7 @@ class InertialAugmentRandomCombo:
 
         out = np.array(x, copy=True)
         plans = [self._sample_ops() for _ in range(B)]
+        self.last_plans = plans
         max_len = max((len(p) for p in plans), default=0)
         if max_len == 0:
             return out
